@@ -171,6 +171,49 @@ def forward(pr, kind, author, association, text, extra=""):
     print(f"forwarded {kind} to {org}/{sid}")
 
 
+def notify_review(pr, rv):
+    url = secret("WORKER_REVIEW_WEBHOOK")
+    if not url or rv["user"]["login"] != "devin-ai-integration[bot]":
+        return
+    findings = []
+    page = 1
+    while True:
+        comments = gh(f"/repos/{REPO}/pulls/{pr['number']}/reviews/{rv['id']}/comments?per_page=100&page={page}")
+        for comment in comments:
+            body = comment.get("body") or ""
+            match = re.search(r"<!-- devin-review-comment (\{.*?\})\s*-->", body)
+            if not match:
+                continue
+            try:
+                meta = json.loads(match[1])
+            except ValueError:
+                continue
+            title = body[match.end():].strip().splitlines()[0] if body[match.end():].strip() else "Finding"
+            severity = next((level for icon, level in (("🔴", "high"), ("🟡", "medium"), ("🟢", "low")) if icon in title), "unknown")
+            findings.append({"title": title.replace("**", "")[:240],
+                             "location": f"{meta.get('file_path', comment.get('path', ''))}:{meta.get('start_line') or comment.get('line') or ''}",
+                             "kind": meta.get("kind", "unknown"), "severity": severity})
+        if len(comments) < 100:
+            break
+        page += 1
+    counts = {field: {} for field in ("severity", "kind")}
+    for finding in findings:
+        for field in counts:
+            value = finding[field]
+            counts[field][value] = counts[field].get(value, 0) + 1
+    rank = {"high": 0, "medium": 1, "low": 2, "unknown": 3}
+    payload = {"repo": REPO, "number": pr["number"], "title": pr["title"],
+               "url": pr["html_url"], "author": pr["user"]["login"],
+               "sha": rv.get("commit_id") or pr["head"]["sha"], "review_id": rv["id"],
+               "counts": counts, "findings": sorted(findings, key=lambda f: rank[f['severity']])[:5]}
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30):
+            pass
+    except (OSError, ValueError):
+        print("devin-bridge: Worker review notification failed")
+
+
 def main():
     event = os.environ.get("GITHUB_EVENT_NAME")
     with open(os.environ["GITHUB_EVENT_PATH"]) as f:
@@ -202,6 +245,7 @@ def main():
     pr = ev["pull_request"]
     if event == "pull_request_review":
         rv = ev["review"]
+        notify_review(pr, rv)
         return forward(pr, f"review ({rv['state'].lower()})", rv["user"]["login"],
                        rv.get("author_association"), rv.get("body") or "")
     if event == "pull_request_review_comment":
