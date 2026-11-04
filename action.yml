@@ -1,0 +1,46 @@
+name: devin-bridge
+description: Bridge GitHub PR events to Devin when the Devin GitHub App lives in another Devin org.
+inputs:
+  mode:
+    description: "bridge (forward comments, /bridge commands, review-all) or feedback (fail while review threads are unresolved)"
+    default: bridge
+  secrets:
+    description: "Pass toJSON(secrets): OWNER_DEVIN_API_KEY plus one DEVIN_KEY_<ORG_ID> per Devin org"
+    default: "{}"
+  user-orgs:
+    description: "JSON map of GitHub login -> Devin org id (vars.DEVIN_USER_ORGS)"
+    default: "{}"
+  owner-org-id:
+    description: "Devin org id that owns the GitHub App (vars.OWNER_DEVIN_ORG_ID)"
+    default: ""
+  pr:
+    description: "PR number for mode=feedback (defaults to the event's PR)"
+    default: ""
+  github-token:
+    default: ${{ github.token }}
+runs:
+  using: composite
+  steps:
+    - if: inputs.mode == 'bridge'
+      shell: bash
+      run: python3 "$GITHUB_ACTION_PATH/bridge/devin_bridge.py"
+      env:
+        GITHUB_ACTION_PATH: ${{ github.action_path }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        DEVIN_SECRETS: ${{ inputs.secrets }}
+        DEVIN_USER_ORGS: ${{ inputs.user-orgs }}
+        OWNER_DEVIN_ORG_ID: ${{ inputs.owner-org-id }}
+    - if: inputs.mode == 'feedback'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR: ${{ inputs.pr || github.event.pull_request.number }}
+      run: |
+        set -o pipefail
+        open=$(gh api graphql --paginate \
+          -f owner="${GITHUB_REPOSITORY%/*}" -f name="${GITHUB_REPOSITORY#*/}" -F pr="$PR" \
+          -f query='query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor}nodes{isResolved}}}}}' \
+          --jq '[.data.repository.pullRequest.reviewThreads.nodes[]|select(.isResolved|not)]|length' \
+          | awk '{s+=$1} END {print s+0}')
+        echo "unresolved review threads: $open"
+        [ "$open" -eq 0 ] || { echo "::error::Resolve the $open open review thread(s) before merging."; exit 1; }

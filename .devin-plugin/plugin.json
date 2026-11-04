@@ -1,0 +1,7 @@
+{
+  "name": "devin-bridge",
+  "version": "1.0.0",
+  "description": "Link Devin sessions in any Devin org to their GitHub PRs through the devin-bridge GitHub Action, and work through CI, review threads and Devin Review findings until the PR is clean.",
+  "author": { "name": "StationedAI" },
+  "keywords": ["devin", "github", "pull-requests", "devin-review"]
+}

@@ -1,0 +1,32 @@
+name: devin-feedback
+
+# Red while any review thread on the PR is unresolved. Make it a required
+# check in branch rules (paid GitHub plans) to block merges until feedback is handled.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number (re-check after resolving threads; GitHub has no thread-resolved trigger)"
+        required: true
+
+permissions:
+  pull-requests: read
+
+concurrency:
+  group: devin-feedback-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  devin-feedback:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: StationedAI/devin-bridge@v1
+        with:
+          mode: feedback
+          pr: ${{ github.event.pull_request.number || inputs.pr }}
