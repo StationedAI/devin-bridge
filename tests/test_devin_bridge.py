@@ -34,6 +34,8 @@ def bridge(monkeypatch, tmp_path):
 
     def fake_call(url, token, body=None, method=None):
         calls.append((method or ("POST" if body is not None else "GET"), url, body, token))
+        if "/sessions?" in url:
+            return {"items": []}
         if url.endswith(f"/sessions/{SID}"):
             return {"tags": state["tags"], "url": "https://app.devin.ai/sessions/abc123", **state["session"]}
         if "/pulls?state=open" in url:

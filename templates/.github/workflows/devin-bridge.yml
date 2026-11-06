@@ -9,13 +9,19 @@ on:
     types: [submitted]
   pull_request_review_comment:
     types: [created]
+  schedule:
+    - cron: '0 * * * *'
   workflow_dispatch:
     inputs:
       action:
         description: "review-all = trigger Devin Review on every open PR"
         default: review-all
         type: choice
-        options: [review-all]
+        options: [review-all, digest]
+
+concurrency:
+  group: devin-bridge-${{ github.repository }}
+  cancel-in-progress: false
 
 permissions:
   contents: read

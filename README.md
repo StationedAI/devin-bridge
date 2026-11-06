@@ -116,7 +116,29 @@ variable of the same name, and opens one PR adding `templates/`. It is safe to r
 | `DEVIN_KEY_<ORG_ID>` | secret, one per Devin org | that org's service-user key; org id upper-cased, non-alphanumerics → `_` (e.g. `org-ab12` → `DEVIN_KEY_ORG_AB12`) |
 | `DEVIN_USER_ORGS` | variable | `{"<github-login>": "<devin-org-id>", ...}`: the org a `/bridge <prompt>` session starts in |
 | `DEVIN_FALLBACK_ORG` | secret (or `fallback-org` input) | optional: Devin org to use when a session's org is out of credits; it also needs its own `DEVIN_KEY_<ORG_ID>` |
+| `WORKER_REVIEW_WEBHOOK` | secret, optional | Worker review-alert URL with token (see "Slack review alerts via the Worker") |
 | `DEVIN_ORG_KEYS` | secret, legacy | `{"<org-id>": "cog_..."}`; still read, prefer `DEVIN_KEY_*` |
+
+## Slack review alerts via the Worker
+
+When the Devin Review bot (`devin-ai-integration[bot]`) posts a review, the Action sends a short
+summary to the Worker's Slack bridge: repo, PR, commit, counts by severity, and the top 5 findings
+with `file:line`. Full comment bodies are never sent. If the webhook fails, the Action still passes.
+
+Set it up on a new repo:
+
+1. Set the repo secret: `gh secret set WORKER_REVIEW_WEBHOOK -R StationedAI/<repo>`. The value
+   is `https://zo-slack-trmnldev.zocomputer.io/devin-review?token=<DEVIN_REVIEW_WEBHOOK_TOKEN>`,
+   and the token is in `/root/zo-slack/.env` on the Worker box. Leave it unset and no alerts are sent.
+2. Optional: give the repo a default Slack channel in the Worker's `DEVIN_REVIEW_CHANNELS`.
+3. Engineers choose where their alerts go in Slack: `devin! github <login>` once, then
+   `devin! notify dm`, `devin! notify #channel` or `devin! notify off`.
+4. Check: open a PR, and within a few minutes of the review the alert appears. Reviews on the
+   same PR reply in the same thread, and the same review is never posted twice.
+
+For findings to show up on GitHub (and so in these alerts), the owner org must have
+Settings → Review → Post findings turned on for all four types: bugs, security, investigate flags,
+and note flags. Also turn on the review link in the PR description and the `Devin Review` status.
 
 ## Check it works
 
