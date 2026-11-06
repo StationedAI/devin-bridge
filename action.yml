@@ -13,6 +13,9 @@ inputs:
   owner-org-id:
     description: "Devin org id that owns the GitHub App (vars.OWNER_DEVIN_ORG_ID)"
     default: ""
+  fallback-org:
+    description: "Devin org to use when a session's org is out of credits (vars.DEVIN_FALLBACK_ORG); needs its DEVIN_KEY_<ORG_ID> secret. Also read from a DEVIN_FALLBACK_ORG secret."
+    default: ""
   pr:
     description: "PR number for mode=feedback (defaults to the event's PR)"
     default: ""
@@ -30,6 +33,7 @@ runs:
         DEVIN_SECRETS: ${{ inputs.secrets }}
         DEVIN_USER_ORGS: ${{ inputs.user-orgs }}
         OWNER_DEVIN_ORG_ID: ${{ inputs.owner-org-id }}
+        DEVIN_FALLBACK_ORG: ${{ inputs.fallback-org }}
     - if: inputs.mode == 'feedback'
       shell: bash
       env:

@@ -19,6 +19,13 @@ A PR is linked to a session by `<!-- devin-session: <org-or-personal-id>/devin-.
 the session must also carry the tag `pr:<repo>#<n>` (set by the bridge), so an
 edited PR body cannot redirect feedback. Only trusted authors are forwarded.
 Comments carrying `<!-- devin-bridge -->` are ours and never forwarded.
+
+Credit fallback: if DEVIN_FALLBACK_ORG (secret or env) names a Devin org with its
+own DEVIN_KEY_<ORG_ID>, a session start refused for credit/quota reasons is
+retried there, and feedback for a PR whose session is suspended for credits
+goes to a continuation session there (the PR is relinked to it). Sessions
+cannot move between orgs. Without a fallback the PR gets a visible notice.
+Reviews never fall back: they are billed to the org that has the GitHub App.
 """
 import json
 import os
@@ -34,7 +41,18 @@ SESSION_RE = re.compile(r"<!--\s*devin-session:\s*([\w-]+)/(devin-[\w-]+)\s*-->"
 TRUSTED = {"OWNER", "MEMBER", "COLLABORATOR"}
 TRUSTED_BOTS = {"devin-ai-integration[bot]"}
 COMMAND_RE = re.compile(r"(?i)^/bridge\b")
+# status_detail values of a suspended session that mean "no credit/quota left"
+CREDIT_STOPS = {"usage_limit_exceeded", "out_of_credits", "out_of_quota", "no_quota_allocation",
+                "org_usage_limit_exceeded", "user_usage_limit_exceeded", "total_session_limit_exceeded",
+                "payment_declined", "contract_expired"}
+CREDIT_ERROR_RE = re.compile(r"(?i)credit|quota|usage limit|budget|billing|payment|limit exceeded")
 REPO = os.environ.get("GITHUB_REPOSITORY", "")
+
+
+class ApiError(Exception):
+    def __init__(self, method, url, code, body):
+        super().__init__(f"{method} {url} -> {code}: {body[:500]}")
+        self.code, self.body = code, body
 
 
 def call(url, token, body=None, method=None):
@@ -51,7 +69,7 @@ def call(url, token, body=None, method=None):
             raw = r.read()
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:
-        sys.exit(f"{method} {url} -> {e.code}: {e.read().decode()[:500]}")
+        raise ApiError(method, url, e.code, e.read().decode(errors="replace")) from None
 
 
 def gh(path, body=None, method=None):
@@ -102,6 +120,55 @@ def org_call(org, path, body=None):
     return call(f"{DEVIN_API}/{org}{path}", key, body)
 
 
+def fallback_org():
+    return secret("DEVIN_FALLBACK_ORG") or None
+
+
+def credit_stopped(session):
+    return (session or {}).get("status") == "suspended" and session.get("status_detail") in CREDIT_STOPS
+
+
+def credit_error(e):
+    # the API does not document which status code means "out of credits", so match on the body
+    return e.code == 402 or (e.code not in (401, 404, 422) and bool(CREDIT_ERROR_RE.search(e.body)))
+
+
+def link_pr(pr, org, sid):
+    body = SESSION_RE.sub("", (pr.get("body") or "").rstrip()).rstrip()
+    body += f"\n\n<!-- devin-session: {org}/{sid} -->"
+    gh(f"/repos/{REPO}/pulls/{pr['number']}", {"body": body}, "PATCH")
+    pr["body"] = body
+
+
+def create_session(org, pr, prompt_text, title, extra_tags=()):
+    s = org_call(org, "/sessions", {"prompt": prompt_text, "title": title,
+                                    "tags": ["devin-bridge", pr_tag(pr["number"]), *extra_tags]})
+    if s is None:
+        return None
+    sid = s["session_id"] if s["session_id"].startswith("devin-") else f"devin-{s['session_id']}"
+    return sid, s
+
+
+def start_with_fallback(org, pr, prompt_text, title, extra_tags=()):
+    """Create the session in org; on a credit refusal (or an instantly credit-suspended
+    session) retry in the fallback org. Returns (org, sid, session) or None."""
+    fb = fallback_org()
+    try:
+        made = create_session(org, pr, prompt_text, title, extra_tags)
+        if made and not (fb and fb != org and credit_stopped(org_call(org, f"/sessions/{made[0]}"))):
+            return (org, *made)
+        if made:
+            print(f"{org}/{made[0]} suspended for credits; retrying in fallback {fb}")
+    except ApiError as e:
+        if not (fb and fb != org and credit_error(e)):
+            raise
+        print(f"{org} refused the session ({e.code}); retrying in fallback {fb}")
+    if not (fb and fb != org and org_key(fb)):
+        return None
+    made = create_session(fb, pr, prompt_text, title, (*extra_tags, f"fallback-from:{org}"))
+    return (fb, *made) if made else None
+
+
 def pr_tag(number):
     return f"pr:{REPO}#{number}"
 
@@ -119,7 +186,7 @@ def linked_session(pr):
     if session is None or pr_tag(pr["number"]) not in session.get("tags", []):
         print(f"ignoring {org}/{sid}: not tagged {pr_tag(pr['number'])}")
         return None
-    return org, sid
+    return org, sid, session
 
 
 def open_prs():
@@ -131,7 +198,9 @@ def open_prs():
 
 def start_session(pr, prompt, author):
     if SESSION_RE.search(pr.get("body") or "") and (linked := linked_session(pr)):
-        org, sid = linked
+        org, sid, session = linked
+        if credit_stopped(session):
+            return continue_elsewhere(pr, org, sid, session, f"/bridge request from @{author}:\n\n{prompt}")
         if mapping("DEVIN_USER_ORGS").get(author) != org:
             return reply(pr["number"], f"@{author}: this PR's Devin session belongs to another Devin org, "
                          "so only members of that org can give it /bridge instructions. Leave a review comment instead.")
@@ -148,13 +217,48 @@ def start_session(pr, prompt, author):
         "Work on this PR's branch and push to it. Reply on the PR with `gh`, "
         f"and end every comment you post with `{MARKER}`."
     )
-    s = org_call(org, "/sessions", {"prompt": prompt_text, "title": f"{REPO}#{pr['number']}: {prompt[:60]}",
-                           "tags": ["devin-bridge", pr_tag(pr["number"])]})
-    sid = s["session_id"] if s["session_id"].startswith("devin-") else f"devin-{s['session_id']}"
-    body = (pr.get("body") or "").rstrip()
-    body = SESSION_RE.sub("", body).rstrip() + f"\n\n<!-- devin-session: {org}/{sid} -->"
-    gh(f"/repos/{REPO}/pulls/{pr['number']}", {"body": body}, "PATCH")
-    reply(pr["number"], f"Devin is on it: {s['url']}")
+    title = f"{REPO}#{pr['number']}: {prompt[:60]}"
+    try:
+        started = start_with_fallback(org, pr, prompt_text, title)
+    except ApiError as e:
+        reply(pr["number"], f"@{author}: Devin org `{org}` refused to start a session (HTTP {e.code}). "
+              "Check that org's credits and its service-user key.")
+        raise
+    if not started:
+        return reply(pr["number"], f"@{author}: Devin org `{org}` is out of credits or quota and no "
+                     "fallback org is set up (DEVIN_FALLBACK_ORG), so no session was started.")
+    used, sid, s = started
+    link_pr(pr, used, sid)
+    note = f" (in fallback org `{used}`: `{org}` is out of credits)" if used != org else ""
+    reply(pr["number"], f"Devin is on it{note}: {s['url']}")
+
+
+def continue_elsewhere(pr, org, sid, session, msg):
+    """The PR's session is suspended for credits: hand the PR to a continuation
+    session in the fallback org, or tell the PR when there is none."""
+    reason = session.get("status_detail")
+    fb = fallback_org()
+    if not (fb and fb != org and org_key(fb)):
+        org_call(org, f"/sessions/{sid}/messages", {"message": msg})  # kept for when credits return
+        return reply(pr["number"], f"The Devin session on this PR ({org}/{sid}) is paused: `{reason}`. "
+                     "Feedback is queued there but will not be acted on until that org has credits again "
+                     "(no fallback org set up).")
+    prompt_text = (
+        f"Continue the work on {pr['html_url']} (repo {REPO}, branch {pr['head']['ref']}). "
+        f"The previous Devin session {session.get('url') or f'{org}/{sid}'} stopped because its org ran out "
+        f"of credits ({reason}). Read the PR, its review threads and CI first, then handle this latest "
+        f"feedback:\n\n{msg}\n\n"
+        "Push to the PR's branch. Reply on the PR with `gh`, "
+        f"and end every comment you post with `{MARKER}`."
+    )
+    made = create_session(fb, pr, prompt_text, f"{REPO}#{pr['number']}: continue ({reason})",
+                          (f"continued-from:{org}/{sid}",))
+    if not made:
+        return None
+    new_sid, s = made
+    link_pr(pr, fb, new_sid)
+    reply(pr["number"], f"The Devin session on this PR ran out of credits (`{reason}`), "
+          f"so a continuation session in fallback org `{fb}` took over: {s['url']}")
 
 
 def forward(pr, kind, author, association, text, extra=""):
@@ -165,8 +269,10 @@ def forward(pr, kind, author, association, text, extra=""):
     linked = linked_session(pr)
     if not linked:
         return
-    org, sid = linked
+    org, sid, session = linked
     msg = f"New {kind} on {pr['html_url']} from @{author}{extra}:\n\n{text}"
+    if credit_stopped(session):
+        return continue_elsewhere(pr, org, sid, session, msg)
     org_call(org, f"/sessions/{sid}/messages", {"message": msg})
     print(f"forwarded {kind} to {org}/{sid}")
 
@@ -211,4 +317,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ApiError as e:
+        sys.exit(str(e))
