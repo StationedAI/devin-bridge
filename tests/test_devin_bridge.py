@@ -27,14 +27,17 @@ def bridge(monkeypatch, tmp_path):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     mod.REPO = REPO
-    calls, state = [], {"pr_body": LINKED_BODY, "tags": [f"pr:{REPO}#7"], "pages": [[], []]}
+    calls, state = [], {"pr_body": LINKED_BODY, "tags": [f"pr:{REPO}#7"], "pages": [[], []],
+                    "session": {}, "refuse": {}}
+
+    state["calls"] = calls
 
     def fake_call(url, token, body=None, method=None):
         calls.append((method or ("POST" if body is not None else "GET"), url, body, token))
         if "/sessions?" in url:
             return {"items": []}
         if url.endswith(f"/sessions/{SID}"):
-            return {"tags": state["tags"]}
+            return {"tags": state["tags"], "url": "https://app.devin.ai/sessions/abc123", **state["session"]}
         if "/pulls?state=open" in url:
             page = int(url.rsplit("page=", 1)[1])
             return state["pages"][page - 1] if page <= len(state["pages"]) else []
@@ -43,6 +46,9 @@ def bridge(monkeypatch, tmp_path):
                     "head": {"ref": "feat"}, "body": state["pr_body"]}
         if url.endswith("/pr-reviews"):
             return {"status": "pending", "commit_sha": "0123456789"}
+        if url.endswith("/sessions") and url.rsplit("/", 2)[1] in state["refuse"]:
+            code, text = state["refuse"][url.rsplit("/", 2)[1]]
+            raise mod.ApiError("POST", url, code, text)
         if url.endswith("/sessions"):
             return {"session_id": SID, "url": "https://app.devin.ai/sessions/abc123"}
         return {}
@@ -183,3 +189,84 @@ def test_legacy_devin_org_keys_secret_still_works(bridge, monkeypatch):
     run, _ = bridge
     monkeypatch.setenv("DEVIN_SECRETS", json.dumps({"DEVIN_ORG_KEYS": json.dumps({ORG: "legacy-token"})}))
     assert posts(run("issue_comment", comment("please change x")), "/messages")[0][3] == "legacy-token"
+
+
+FALLBACK = "org-fallback"
+
+
+@pytest.fixture
+def with_fallback(monkeypatch):
+    monkeypatch.setenv("DEVIN_SECRETS", json.dumps({
+        "OWNER_DEVIN_API_KEY": "owner-token", "DEVIN_KEY_PERSONAL_CLERK_USER_ABC": "org-token",
+        "DEVIN_KEY_ORG_FALLBACK": "fallback-token", "DEVIN_FALLBACK_ORG": FALLBACK}))
+
+
+def review_comment(text="rename this"):
+    return {"comment": {"body": text, "user": {"login": "dev"}, "author_association": "MEMBER",
+                        "path": "src/x.py", "line": 3},
+            "pull_request": {"number": 7, "html_url": f"https://github.com/{REPO}/pull/7",
+                             "head": {"ref": "feat"}, "body": LINKED_BODY}}
+
+
+def test_feedback_for_credit_suspended_session_continues_in_fallback_org(bridge, with_fallback):
+    run, state = bridge
+    state["session"] = {"status": "suspended", "status_detail": "out_of_credits"}
+    calls = run("pull_request_review_comment", review_comment())
+    new = posts(calls, f"/{FALLBACK}/sessions")[0]
+    assert new[3] == "fallback-token" and "rename this" in new[2]["prompt"]
+    assert f"pr:{REPO}#7" in new[2]["tags"] and f"continued-from:{ORG}/{SID}" in new[2]["tags"]
+    assert f"{FALLBACK}/{SID}" in posts(calls, "/pulls/7")[0][2]["body"]
+    assert not posts(calls, "/messages")
+
+
+def test_feedback_for_credit_suspended_session_without_fallback_warns_on_pr(bridge):
+    run, state = bridge
+    state["session"] = {"status": "suspended", "status_detail": "org_usage_limit_exceeded"}
+    calls = run("pull_request_review_comment", review_comment())
+    assert posts(calls, f"/sessions/{SID}/messages")
+    assert "org_usage_limit_exceeded" in posts(calls, "/comments")[0][2]["body"]
+    assert not posts(calls, "/sessions")
+
+
+def test_feedback_for_sleeping_session_is_forwarded_not_moved(bridge, with_fallback):
+    run, state = bridge
+    state["session"] = {"status": "suspended", "status_detail": "inactivity"}
+    calls = run("pull_request_review_comment", review_comment())
+    assert posts(calls, f"/sessions/{SID}/messages") and not posts(calls, "/sessions")
+
+
+def test_prompt_falls_back_when_org_refuses_for_credits(bridge, with_fallback):
+    run, state = bridge
+    state["pr_body"] = "text"
+    state["refuse"] = {ORG: (403, '{"detail": "Organization is out of credits"}')}
+    calls = run("issue_comment", comment("/bridge fix it"))
+    assert f"fallback-from:{ORG}" in posts(calls, f"/{FALLBACK}/sessions")[0][2]["tags"]
+    assert f"{FALLBACK}/{SID}" in posts(calls, "/pulls/7")[0][2]["body"]
+    assert "fallback org" in posts(calls, "/comments")[-1][2]["body"]
+
+
+def test_prompt_falls_back_when_new_session_is_credit_suspended(bridge, with_fallback):
+    run, state = bridge
+    state["pr_body"] = "text"
+    state["session"] = {"status": "suspended", "status_detail": "out_of_quota"}
+    calls = run("issue_comment", comment("/bridge fix it"))
+    assert posts(calls, f"/{ORG}/sessions") and posts(calls, f"/{FALLBACK}/sessions")
+
+
+def test_auth_error_does_not_fall_back(bridge, with_fallback):
+    run, state = bridge
+    state["pr_body"] = "text"
+    state["refuse"] = {ORG: (401, '{"detail": "invalid token"}')}
+    with pytest.raises(Exception, match="401"):
+        run("issue_comment", comment("/bridge fix it"))
+    assert not posts(state["calls"], f"/{FALLBACK}/sessions")
+    assert "refused" in posts(state["calls"], "/comments")[0][2]["body"]
+
+
+def test_credit_refusal_without_fallback_is_reported_on_pr(bridge):
+    run, state = bridge
+    state["pr_body"] = "text"
+    state["refuse"] = {ORG: (403, '{"detail": "out of credits"}')}
+    with pytest.raises(Exception, match="403"):
+        run("issue_comment", comment("/bridge fix it"))
+    assert "refused" in posts(state["calls"], "/comments")[0][2]["body"]

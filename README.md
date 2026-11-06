@@ -115,6 +115,7 @@ variable of the same name, and opens one PR adding `templates/`. It is safe to r
 | `OWNER_DEVIN_ORG_ID` | variable | owner org id |
 | `DEVIN_KEY_<ORG_ID>` | secret, one per Devin org | that org's service-user key; org id upper-cased, non-alphanumerics → `_` (e.g. `org-ab12` → `DEVIN_KEY_ORG_AB12`) |
 | `DEVIN_USER_ORGS` | variable | `{"<github-login>": "<devin-org-id>", ...}`: the org a `/bridge <prompt>` session starts in |
+| `DEVIN_FALLBACK_ORG` | secret (or `fallback-org` input) | optional: Devin org to use when a session's org is out of credits; it also needs its own `DEVIN_KEY_<ORG_ID>` |
 | `WORKER_REVIEW_WEBHOOK` | secret, optional | Worker review-alert URL with token (see "Slack review alerts via the Worker") |
 | `DEVIN_ORG_KEYS` | secret, legacy | `{"<org-id>": "cog_..."}`; still read, prefer `DEVIN_KEY_*` |
 
@@ -150,6 +151,27 @@ and note flags. Also turn on the review link in the PR description and the `Devi
    the message.
 4. **Gate:** leave a thread unresolved. `devin-feedback` is red; resolve it and re-run
    `gh workflow run devin-feedback.yml -f pr=<n> --ref <branch>`.
+
+## Credit fallback
+
+Set the `DEVIN_FALLBACK_ORG` secret to another Devin org (for example an Enterprise account with
+credits) and add that org's `DEVIN_KEY_<ORG_ID>`. Then:
+
+- **`/bridge <prompt>`:** if the commenter's org refuses the session for credit/quota reasons, or the
+  new session is suspended right away with a credit `status_detail`, the session starts in the
+  fallback org instead (tagged `fallback-from:<org>`).
+- **Feedback on a PR whose session is suspended for credits** (`out_of_credits`, `out_of_quota`,
+  `org_usage_limit_exceeded`, ...): sessions can't move between orgs, so the bridge starts a
+  continuation session in the fallback org with the PR context and the new feedback, relinks the PR
+  to it (tagged `continued-from:<org>/<session>`) and says so on the PR.
+- **Without a fallback** the message is still queued on the suspended session and the PR gets a
+  notice that nobody will act on it until that org has credits again.
+- Sessions asleep for `inactivity` are not credit stops; they get the message and wake as usual.
+- **Reviews don't fall back.** Devin Review is billed to the org that has the GitHub App.
+- The Devin API doesn't document which HTTP status means "out of credits", so a refused start
+  counts as a credit refusal on 402, or on another non-401/404/422 error whose body mentions
+  credits, quota, limits, budget, billing or payment. Auth and validation errors never fall back.
+- The fallback org's sessions need `DEVIN_BRIDGE_KEY` (its own key) like any other org.
 
 ## Limits
 
